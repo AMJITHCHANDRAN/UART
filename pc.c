@@ -1,82 +1,69 @@
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <errno.h>
-#include <termios.h>
+#include <windows.h>
+#include <time.h>
 
-#define BAUD_RATE B2400
 #define CHUNK_SIZE 32  // Chunk size for sending/receiving data
 
-int calculate_speed(time_t start_time, time_t end_time, int data_size) {
-    double time_taken = difftime(end_time, start_time);
-    int speed = (data_size * 8) / time_taken;  // Convert bytes to bits
-    return speed;
-}
-
-void send_data_to_arduino(int serial_port, char *data) {
+void send_data_to_virtual_serial(HANDLE serial_port, char *data) {
+    DWORD bytes_written;
+    LARGE_INTEGER start_time, end_time, frequency;
+    QueryPerformanceCounter(&start_time);
     for (int i = 0; i < strlen(data); i += CHUNK_SIZE) {
         char chunk[CHUNK_SIZE + 1];
         strncpy(chunk, &data[i], CHUNK_SIZE);
         chunk[CHUNK_SIZE] = '\0';
-        write(serial_port, chunk, CHUNK_SIZE);
-        usleep(10000);  // Add delay for transmission
+        WriteFile(serial_port, chunk, CHUNK_SIZE, &bytes_written, NULL);
+        Sleep(10);  // Add delay for transmission
     }
-    tcflush(serial_port, TCIOFLUSH);
+    FlushFileBuffers(serial_port);
+    QueryPerformanceCounter(&end_time);
+    QueryPerformanceFrequency(&frequency);
+    double time_taken = (double)(end_time.QuadPart - start_time.QuadPart) / frequency.QuadPart;
+    double speed = (strlen(data) * 8) / time_taken;  // Calculate speed in bits/second
+    printf("Outgoing speed: %.2f bits/second\n", speed);
 }
 
-char* receive_data_from_arduino(int serial_port) {
-    char received_data[EEPROM_SIZE];
-    int bytes_read = 0;
-    time_t start_time = time(NULL);
-    while (bytes_read < EEPROM_SIZE) {
+void receive_data_from_virtual_serial(HANDLE serial_port) {
+    char received_data[1024];
+    DWORD bytes_read;
+    LARGE_INTEGER start_time, end_time, frequency;
+    QueryPerformanceCounter(&start_time);
+    int bytes_read_total = 0;
+    while (bytes_read_total < 1024) {
         char chunk[CHUNK_SIZE + 1];
-        int bytes_available = read(serial_port, chunk, CHUNK_SIZE);
-        if (bytes_available > 0) {
-            strncat(received_data, chunk, bytes_available);
-            bytes_read += bytes_available;
-            time_t end_time = time(NULL);
-            int speed = calculate_speed(start_time, end_time, bytes_read);
-            printf("Incoming speed: %d bits/second\n", speed);
+        ReadFile(serial_port, chunk, CHUNK_SIZE, &bytes_read, NULL);
+        if (bytes_read > 0) {
+            strncat(received_data, chunk, bytes_read);
+            bytes_read_total += bytes_read;
         }
     }
-    return strdup(received_data);
+    QueryPerformanceCounter(&end_time);
+    QueryPerformanceFrequency(&frequency);
+    double time_taken = (double)(end_time.QuadPart - start_time.QuadPart) / frequency.QuadPart;
+    double speed = (bytes_read_total * 8) / time_taken;  // Calculate speed in bits/second
+    printf("Incoming speed: %.2f bits/second\n", speed);
+    printf("Received data: %s\n", received_data);
 }
 
 int main() {
-    int serial_port = open("/dev/ttyUSB0", O_RDWR);
-    if (serial_port < 0) {
-        fprintf(stderr, "Error %i from open: %s\n", errno, strerror(errno));
+    HANDLE serial_port_arduino = CreateFile("COM1", GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (serial_port_arduino == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "Error %d from CreateFile\n", GetLastError());
         return 1;
     }
 
-    struct termios tty;
-    memset(&tty, 0, sizeof tty);
-    if (tcgetattr(serial_port, &tty) != 0) {
-        fprintf(stderr, "Error %i from tcgetattr: %s\n", errno, strerror(errno));
-        return 1;
-    }
-    cfsetospeed(&tty, BAUD_RATE);
-    cfsetispeed(&tty, BAUD_RATE);
-    tty.c_cflag |= (CLOCAL | CREAD);
-    tty.c_cflag &= ~PARENB;
-    tty.c_cflag &= ~CSTOPB;
-    tty.c_cflag &= ~CSIZE;
-    tty.c_cflag |= CS8;
-    tty.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG);
-    tty.c_iflag &= ~(IXON | IXOFF | IXANY);
-    tty.c_oflag &= ~OPOST;
-    tty.c_cc[VMIN] = 0;
-    tty.c_cc[VTIME] = 10;
-    if (tcsetattr(serial_port, TCSANOW, &tty) != 0) {
-        fprintf(stderr, "Error %i from tcsetattr: %s\n", errno, strerror(errno));
+    HANDLE serial_port_pc = CreateFile("COM2", GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (serial_port_pc == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "Error %d from CreateFile\n", GetLastError());
+        CloseHandle(serial_port_arduino);
         return 1;
     }
 
     FILE *file = fopen("data.txt", "r");
     if (!file) {
         fprintf(stderr, "Error opening file\n");
+        CloseHandle(serial_port_arduino);
+        CloseHandle(serial_port_pc);
         return 1;
     }
     fseek(file, 0, SEEK_END);
@@ -86,12 +73,11 @@ int main() {
     fread(data, 1, data_size, file);
     fclose(file);
 
-    send_data_to_arduino(serial_port, data);
-    char *received_data = receive_data_from_arduino(serial_port);
-    printf("Received data: %s\n", received_data);
+    send_data_to_virtual_serial(serial_port_arduino, data);
+    receive_data_from_virtual_serial(serial_port_pc);
 
-    close(serial_port);
-    free(received_data);
+    CloseHandle(serial_port_arduino);
+    CloseHandle(serial_port_pc);
 
     return 0;
 }
